@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.next/
+.env
+.env.*
+data/*
+!data/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+*.wav
+*.mp3
