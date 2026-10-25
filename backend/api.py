@@ -1,4 +1,5 @@
 import io, json, subprocess, sys, uuid, wave
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,13 +38,20 @@ def start_training(epochs:int=20):
     if epochs<1 or epochs>1000:raise HTTPException(400,'epochs must be 1-1000')
     if len(load_rows())<2:raise HTTPException(400,'At least 2 recordings required')
     import os
+    DATA.mkdir(parents=True,exist_ok=True)
     log=open(DATA/'train_stdout.log','a')
-    process=subprocess.Popen([sys.executable,str(Path(__file__).parent/'train.py'),'--epochs',str(epochs)],cwd=str(Path(__file__).parent),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
-    return {'pid':process.pid,'status':'started'}
+    try:
+        process=subprocess.Popen([sys.executable,str(Path(__file__).parent/'train.py'),'--epochs',str(epochs)],cwd=str(Path(__file__).parent),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+    finally:
+        log.close()
+    return {'pid':process.pid,'status':'started','message':'Training started; check /training for progress and errors.'}
 @app.get('/training')
 def training():
     path=DATA/'training_log.jsonl'
-    return {'history':[json.loads(s) for s in path.read_text().splitlines()[-100:]] if path.exists() else []}
+    history=[json.loads(s) for s in path.read_text(encoding='utf-8').splitlines()[-100:] if s.strip()] if path.exists() else []
+    log_path=DATA/'train_stdout.log'
+    log_tail=log_path.read_text(encoding='utf-8',errors='replace').splitlines()[-20:] if log_path.exists() else []
+    return {'history':history,'checkpoint':CKPT.exists(),'log_tail':log_tail,'recordings':len(load_rows())}
 @app.post('/speak')
 def speak(request:Speech):
     if not CKPT.exists():raise HTTPException(409, detail={'code':'MODEL_NOT_TRAINED','message':'No trained model checkpoint found. Upload at least 2 labeled WAV recordings, start training, and wait for the checkpoint before generating speech.','next_step':'POST /train then check GET /health until checkpoint is true.'})
