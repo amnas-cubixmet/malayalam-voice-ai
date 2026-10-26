@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import time
 import unicodedata
 import uuid
 import wave
@@ -83,7 +84,17 @@ def atomic_json(path, value):
     temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         temp.write_text(json.dumps(value, ensure_ascii=False, allow_nan=False), encoding='utf-8')
-        os.replace(temp, path)
+        # Windows can briefly deny replacement while antivirus or an external
+        # process has the destination open. Retry sharing violations instead of
+        # turning an otherwise healthy training epoch into a failed job.
+        for attempt in range(10):
+            try:
+                os.replace(temp, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(min(0.05 * (2 ** attempt), 0.5))
     finally:
         temp.unlink(missing_ok=True)
 

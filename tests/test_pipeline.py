@@ -173,6 +173,26 @@ def test_streamed_request_limit():
         assert response.status_code == 413
 
 
+def test_atomic_status_write_retries_transient_windows_lock(tmp_path, monkeypatch):
+    path = tmp_path / 'training_status.json'
+    original_replace = core.os.replace
+    calls = 0
+
+    def temporarily_locked(source, destination):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise PermissionError(5, 'Access is denied', str(destination))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(core.os, 'replace', temporarily_locked)
+    monkeypatch.setattr(core.time, 'sleep', lambda _seconds: None)
+    core.atomic_json(path, {'status': 'running', 'epoch': 6})
+    assert calls == 3
+    assert json.loads(path.read_text(encoding='utf-8')) == {'status': 'running', 'epoch': 6}
+    assert list(tmp_path.glob('*.tmp')) == []
+
+
 def test_nonfinite_checkpoint_and_reconstruction_failure(monkeypatch):
     with TestClient(api.app) as client:
         upload(client); upload(client)

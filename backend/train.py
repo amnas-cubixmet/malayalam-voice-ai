@@ -13,6 +13,7 @@ from core import (DATA, CKPT, CONFIG, FORMAT_VERSION, ScratchTTS, load_rows,
                   read_wav, recording_path, mel_spec, encode, vocab_from_rows, atomic_json)
 
 STATUS = DATA / 'training_status.json'
+STATUS_LOCK = DATA / 'training_status.lock'
 LOCK = DATA / 'training.lock'
 DATA_LOCK = DATA / 'dataset.lock'
 
@@ -38,7 +39,10 @@ def is_training():
 
 
 def read_status():
-    status = json.loads(STATUS.read_text(encoding='utf-8')) if STATUS.exists() else {'status': 'idle', 'history': []}
+    # Coordinate Windows readers with the atomic writer; Windows may deny a
+    # rename while another process has the status file open for reading.
+    with FileLock(STATUS_LOCK):
+        status = json.loads(STATUS.read_text(encoding='utf-8')) if STATUS.exists() else {'status': 'idle', 'history': []}
     active = is_training()
     if not active and status['status'] in ('starting', 'running'):
         status.update(status='interrupted', error='Training stopped before completion. Start a new run; any previous valid checkpoint is preserved.')
@@ -59,7 +63,8 @@ def train(epochs=20, lr=0.0003, lock=None, job_id=None):
             with log_path.open('a', encoding='utf-8') as f:
                 f.write(message + '\n')
         state['updated_at'] = now()
-        atomic_json(STATUS, state)
+        with FileLock(STATUS_LOCK):
+            atomic_json(STATUS, state)
     try:
         log_path.write_text('', encoding='utf-8')
         report('Validating dataset and audio dependencies…')
