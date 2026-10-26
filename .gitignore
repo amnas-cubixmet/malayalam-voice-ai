@@ -11,3 +11,11 @@ checkpoints/*
 !checkpoints/.gitkeep
 *.wav
 *.mp3
+*.pt
+*.pth
+*.ckpt
+*.tmp
+*.tsbuildinfo
+.pytest_cache/
+playwright-report/
+test-results/

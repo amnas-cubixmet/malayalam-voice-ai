@@ -1,76 +1,225 @@
-import io, json, subprocess, sys, uuid, wave
-from datetime import datetime, timezone
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import numpy as np
+"""Local-only FastAPI service. Bind to loopback; no authentication is provided."""
+import io
+import json
+import logging
+import os
+import re
+import threading
+import uuid
+import wave
+from contextlib import asynccontextmanager
+
 import torch
-from core import *
-app=FastAPI(title='Malayalam Voice AI - Scratch Prototype')
-app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:3000'],allow_methods=['*'],allow_headers=['*'])
-AUDIO.mkdir(parents=True,exist_ok=True)
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from filelock import FileLock, Timeout
+from pydantic import BaseModel, Field
+
+from core import (DATA, AUDIO, META, OUTPUT, MAX_BYTES, SR, validate_text, read_wav,
+                  load_rows, checkpoint_status, load_checkpoint, encode, reconstruct, save_wav, atomic_json)
+from train import train, acquire_training_lock, read_status, DATA_LOCK, STATUS, now
+
+logger = logging.getLogger(__name__)
+workers = set()
+synthesis_lock = threading.Lock()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    torch.set_num_threads(int(os.environ.get('VOICE_TORCH_THREADS', '2')))
+    yield
+    # Normal shutdown waits for an active training job; abrupt termination is reported on restart.
+    for worker in list(workers):
+        worker.join()
+
+
+class UploadLimitMiddleware:
+    """Bound the streamed body before multipart parsing spools it to disk."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or scope['method'] != 'POST':
+            return await self.app(scope, receive, send)
+        limit = MAX_BYTES + 65536 if scope['path'] == '/dataset' else 65536
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            received += len(message.get('body', b''))
+            if received > limit:
+                raise HTTPException(413, detail={'code': 'REQUEST_TOO_LARGE', 'message': 'Upload exceeds the request size limit (15 MB audio maximum).'})
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+app = FastAPI(title='Malayalam Voice AI — Scratch Baseline', lifespan=lifespan)
+app.add_middleware(UploadLimitMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000'],
+                   allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
+
+
+def error(status, code, message):
+    return HTTPException(status, detail={'code': code, 'message': message})
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc):
+    message = '; '.join(f'{".".join(str(x) for x in e["loc"])}: {e["msg"]}' for e in exc.errors())
+    return JSONResponse(status_code=422, content={'detail': {'code': 'INVALID_REQUEST', 'message': message}})
+
+
+@app.exception_handler(Exception)
+async def unexpected_error(request: Request, exc):
+    logger.exception('Request failed: %s', request.url.path)
+    return JSONResponse(status_code=500, content={'detail': {'code': 'INTERNAL_ERROR', 'message': 'The operation failed. See the backend terminal for details.'}})
+
+
 class Speech(BaseModel):
-    text:str
-    emotion:str='neutral'
-    speed:float=1.0
+    text: str = Field(min_length=1, max_length=500)
+    emotion: str = 'neutral'
+    speed: float = Field(default=1.0, ge=0.6, le=1.5, allow_inf_nan=False)
+
+
+def dataset_rows():
+    try:
+        with FileLock(DATA_LOCK, timeout=10):
+            return load_rows()
+    except Exception as exc:
+        raise error(409, 'DATASET_INVALID', 'Dataset metadata is invalid or unavailable. Check data/metadata.jsonl and the backend logs.') from exc
+
+
 @app.get('/health')
-def health():return {'ok':True,'checkpoint':CKPT.exists()}
+def health():
+    return {'ok': True, **checkpoint_status()}
+
+
 @app.get('/dataset')
-def dataset():return {'samples':load_rows()}
-@app.post('/dataset')
-async def add_recording(text:str=Form(...),audio:UploadFile=File(...)):
-    text=normalize(text)
-    if not text or len(text)>1000:raise HTTPException(400,'Invalid transcript')
-    raw=await audio.read()
-    if len(raw)>15_000_000:raise HTTPException(413,'Audio too large')
+def dataset():
+    DATA.mkdir(parents=True, exist_ok=True)
+    rows = dataset_rows()
+    return {'samples': rows, 'count': len(rows)}
+
+
+@app.post('/dataset', status_code=201)
+async def add_recording(text: str = Form(...), audio: UploadFile = File(...)):
     try:
-        with wave.open(io.BytesIO(raw),'rb') as f:
-            valid=f.getnchannels()==1 and f.getsampwidth()==2 and f.getframerate()==SR and f.getnframes()>SR//2
-        if not valid:raise ValueError('Unsupported WAV format')
-    except Exception:raise HTTPException(400,'Use mono PCM 16-bit WAV, 22050 Hz, at least 0.5 seconds')
-    name=str(uuid.uuid4())+'.wav';(AUDIO/name).write_bytes(raw)
-    with META.open('a') as f:f.write(json.dumps({'file':name,'text':text},ensure_ascii=False)+'\n')
-    return {'file':name,'text':text}
-@app.post('/train')
-def start_training(epochs:int=20):
-    if epochs<1 or epochs>1000:raise HTTPException(400,'epochs must be 1-1000')
-    if len(load_rows())<2:raise HTTPException(400,'At least 2 recordings required')
-    import os
-    DATA.mkdir(parents=True,exist_ok=True)
-    log=open(DATA/'train_stdout.log','a')
-    try:
-        process=subprocess.Popen([sys.executable,str(Path(__file__).parent/'train.py'),'--epochs',str(epochs)],cwd=str(Path(__file__).parent),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        text = validate_text(text)
+        raw = await audio.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            raise error(413, 'AUDIO_TOO_LARGE', 'WAV upload must be no larger than 15 MB.')
+        try:
+            samples = read_wav(io.BytesIO(raw))
+        except (ValueError, wave.Error, EOFError) as exc:
+            raise error(400, 'INVALID_AUDIO', str(exc) or 'Invalid WAV file.') from exc
+        AUDIO.mkdir(parents=True, exist_ok=True)
+        name = uuid.uuid4().hex + '.wav'
+        row = {'file': name, 'text': text, 'duration': round(len(samples) / SR, 3)}
+        with FileLock(DATA_LOCK, timeout=10):
+            rows = load_rows()
+            path = AUDIO / name
+            path.write_bytes(raw)
+            temp = META.with_suffix('.tmp')
+            try:
+                temp.write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows + [row]), encoding='utf-8')
+                os.replace(temp, META)
+            except Exception:
+                path.unlink(missing_ok=True)
+                raise
+            finally:
+                temp.unlink(missing_ok=True)
+        return {**row, 'count': len(rows) + 1, 'message': 'Recording and transcript saved.'}
+    except ValueError as exc:
+        raise error(400, 'INVALID_DATASET', str(exc)) from exc
     finally:
-        log.close()
-    return {'pid':process.pid,'status':'started','message':'Training started; check /training for progress and errors.'}
+        await audio.close()
+
+
+@app.post('/train', status_code=202)
+def start_training(epochs: int = Query(default=20, ge=1, le=1000)):
+    try:
+        lock = acquire_training_lock()
+    except Timeout:
+        raise error(409, 'TRAINING_ACTIVE', 'A training job is already running. Follow its progress below.')
+    try:
+        rows = dataset_rows()
+        if len(rows) < 2:
+            raise error(400, 'DATASET_TOO_SMALL', 'Upload at least two labeled recordings before training.')
+        job_id = uuid.uuid4().hex
+        atomic_json(STATUS, {'job_id': job_id, 'status': 'starting', 'epochs': epochs, 'epoch': 0,
+                             'progress': 0, 'history': [], 'log_tail': [], 'error': None, 'started_at': now()})
+        def run():
+            try:
+                train(epochs, lock=lock, job_id=job_id)
+            except Exception:
+                logger.exception('Training job %s failed', job_id)
+            finally:
+                workers.discard(threading.current_thread())
+        worker = threading.Thread(target=run, name=f'training-{job_id}', daemon=False)
+        workers.add(worker)
+        worker.start()
+    except Exception:
+        lock.release()
+        raise
+    return {'job_id': job_id, 'status': 'starting', 'message': 'Training started. Follow progress and errors in /training.'}
+
+
 @app.get('/training')
 def training():
-    path=DATA/'training_log.jsonl'
-    history=[json.loads(s) for s in path.read_text(encoding='utf-8').splitlines()[-100:] if s.strip()] if path.exists() else []
-    log_path=DATA/'train_stdout.log'
-    log_tail=log_path.read_text(encoding='utf-8',errors='replace').splitlines()[-20:] if log_path.exists() else []
-    return {'history':history,'checkpoint':CKPT.exists(),'log_tail':log_tail,'recordings':len(load_rows())}
+    DATA.mkdir(parents=True, exist_ok=True)
+    return {**read_status(), **checkpoint_status(), 'recordings': len(dataset_rows())}
+
+
 @app.post('/speak')
-def speak(request:Speech):
-    if not CKPT.exists():raise HTTPException(409, detail={'code':'MODEL_NOT_TRAINED','message':'No trained model checkpoint found. Upload at least 2 labeled WAV recordings, start training, and wait for the checkpoint before generating speech.','next_step':'POST /train then check GET /health until checkpoint is true.'})
-    if not request.text.strip() or len(request.text)>500:raise HTTPException(400,'Text length must be 1-500')
-    if not 0.6<=request.speed<=1.5:raise HTTPException(400,'Speed must be 0.6-1.5')
-    # Checkpoint is locally generated by this project. Never load untrusted checkpoint files.
-    checkpoint=torch.load(CKPT,map_location='cpu',weights_only=True)
-    vocab=checkpoint['vocab'];model=ScratchTTS(len(vocab));model.load_state_dict(checkpoint['state']);model.eval()
-    tokens=encode(request.text,vocab)
-    if any(c not in vocab for c in normalize(request.text)):raise HTTPException(400,'Unknown characters: add examples containing them and retrain')
-    frames=min(3000,max(40,int(len(tokens)*checkpoint['frames_per_char']/request.speed)))
-    with torch.no_grad():mel=model(tokens,frames)
-    try:audio=reconstruct(mel)
-    except Exception as e:raise HTTPException(500,f'Audio reconstruction failed: {type(e).__name__}')
-    output=DATA/(str(uuid.uuid4())+'.wav');save_wav(output,audio)
-    return {'url':'/audio/'+output.name,'emotion_requested':request.emotion,'emotion_supported':False,'note':'Emotion conditioning is not trained in this baseline.'}
+def speak(request: Speech):
+    if request.emotion != 'neutral':
+        raise error(400, 'EMOTION_UNSUPPORTED', 'Emotion conditioning is not implemented. Use neutral.')
+    if not synthesis_lock.acquire(blocking=False):
+        raise error(409, 'SYNTHESIS_ACTIVE', 'Another audio generation is running. Try again when it finishes.')
+    try:
+        try:
+            text = validate_text(request.text, limit=500)
+        except ValueError as exc:
+            raise error(400, 'INVALID_TEXT', str(exc)) from exc
+        try:
+            model, cp = load_checkpoint()
+        except FileNotFoundError as exc:
+            raise error(409, 'MODEL_NOT_TRAINED', str(exc)) from exc
+        except Exception as exc:
+            logger.exception('Checkpoint loading failed')
+            raise error(409, 'CHECKPOINT_INVALID', 'The local checkpoint is corrupt or incompatible. Retrain with this version.') from exc
+        try:
+            tokens = encode(text, cp['vocab'])
+        except ValueError as exc:
+            raise error(400, 'UNSUPPORTED_CHARACTERS', str(exc)) from exc
+        frames = max(40, int(len(tokens) * cp['frames_per_char'] / request.speed))
+        if frames > 3000:
+            raise error(400, 'SPEECH_TOO_LONG', 'Estimated speech exceeds 35 seconds. Generate shorter sentences separately.')
+        try:
+            with torch.inference_mode():
+                mel = model(tokens, frames)
+                audio = reconstruct(mel)
+            OUTPUT.mkdir(parents=True, exist_ok=True)
+            output = OUTPUT / (uuid.uuid4().hex + '.wav')
+            save_wav(output, audio)
+        except Exception as exc:
+            logger.exception('Synthesis failed')
+            raise error(500, 'SYNTHESIS_FAILED', 'Audio reconstruction failed. See backend logs; retrain if model output is invalid.') from exc
+        return {'url': '/audio/' + output.name, 'sample_rate': SR, 'duration': len(audio) / SR,
+                'emotion_supported': False, 'note': 'Generated by the scratch baseline. Intelligibility and voice similarity are not guaranteed.'}
+    finally:
+        synthesis_lock.release()
+
+
 @app.get('/audio/{filename}')
-def get_audio(filename:str):
-    if not filename.endswith('.wav') or '/' in filename or '..' in filename:raise HTTPException(400,'Invalid filename')
-    path=DATA/filename
-    if not path.is_file():raise HTTPException(404,'Not found')
-    return FileResponse(path,media_type='audio/wav')
+def get_audio(filename: str):
+    if not re.fullmatch(r'[0-9a-f]{32}\.wav', filename):
+        raise error(400, 'INVALID_FILENAME', 'Invalid generated-audio filename.')
+    path = OUTPUT / filename
+    if path.is_symlink() or path.resolve().parent != OUTPUT.resolve() or not path.is_file():
+        raise error(404, 'AUDIO_NOT_FOUND', 'Generated audio was not found.')
+    return FileResponse(path, media_type='audio/wav', filename=filename, content_disposition_type='inline')
