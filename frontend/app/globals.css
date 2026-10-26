@@ -1,0 +1,160 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  font-family: system-ui, "Noto Sans Malayalam", sans-serif;
+  background: #101827;
+  color: #edf3fa;
+  margin: 0;
+  line-height: 1.6;
+}
+main {
+  max-width: 900px;
+  margin: auto;
+  padding: 32px 24px;
+}
+h1 {
+  font-size: clamp(2rem, 6vw, 3rem);
+  margin: 8px 0;
+}
+h2 {
+  margin-top: 0;
+}
+p {
+  color: #c5d2e2;
+}
+.eyebrow {
+  color: #77d4dd;
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+}
+section {
+  background: #1d293b;
+  padding: 24px;
+  border: 1px solid #34465e;
+  border-radius: 16px;
+  margin: 20px 0;
+}
+label {
+  display: block;
+  margin: 16px 0 8px;
+  font-weight: 600;
+}
+textarea,
+input {
+  font: inherit;
+  max-width: 100%;
+}
+textarea {
+  display: block;
+  width: 100%;
+  min-height: 110px;
+  padding: 12px;
+  border: 1px solid #607692;
+  border-radius: 8px;
+  background: #101827;
+  color: white;
+}
+input[type="number"] {
+  width: 100px;
+  padding: 10px;
+  border-radius: 8px;
+  margin-right: 12px;
+}
+button {
+  font: inherit;
+  font-weight: 600;
+  padding: 11px 16px;
+  border-radius: 8px;
+  background: #86e3dc;
+  color: #10272f;
+  border: 0;
+  cursor: pointer;
+  margin: 8px 8px 8px 0;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+:focus-visible {
+  outline: 3px solid #ffc76b;
+  outline-offset: 3px;
+}
+.notice,
+.status,
+.error,
+.ready {
+  padding: 12px 16px;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+.notice {
+  background: #343021;
+  color: #ffdf9b;
+}
+.status {
+  background: #172e40;
+  margin-top: 16px;
+}
+.error {
+  background: #4c222a;
+  color: #ffd0d0;
+}
+.ready {
+  background: #164036;
+  color: #9eebcb;
+}
+.samples {
+  max-height: 240px;
+  overflow: auto;
+  padding-left: 24px;
+}
+.samples li {
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+small {
+  display: block;
+  color: #a9bace;
+}
+progress {
+  width: 100%;
+  accent-color: #86e3dc;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #101827;
+  padding: 12px;
+  max-height: 260px;
+  overflow: auto;
+}
+details {
+  margin-top: 12px;
+}
+summary {
+  cursor: pointer;
+}
+audio {
+  display: block;
+  width: 100%;
+  margin: 14px 0;
+}
+footer {
+  color: #a9bace;
+  padding: 16px 0;
+}
+@media (max-width: 560px) {
+  main {
+    padding: 20px 12px;
+  }
+  section {
+    padding: 18px 14px;
+  }
+  button {
+    min-height: 46px;
+  }
+  .buttons button {
+    width: 100%;
+  }
+}
