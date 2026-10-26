@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from core import (DATA, AUDIO, META, OUTPUT, MAX_BYTES, SR, validate_text, read_wav,
                   load_rows, checkpoint_status, load_checkpoint, encode, reconstruct, save_wav, atomic_json)
-from train import train, acquire_training_lock, read_status, DATA_LOCK, STATUS, now
+from train import train, acquire_training_lock, read_status, DATA_LOCK, STATUS, STATUS_LOCK, now
 
 logger = logging.getLogger(__name__)
 workers = set()
@@ -150,8 +150,9 @@ def start_training(epochs: int = Query(default=20, ge=1, le=1000)):
         if len(rows) < 2:
             raise error(400, 'DATASET_TOO_SMALL', 'Upload at least two labeled recordings before training.')
         job_id = uuid.uuid4().hex
-        atomic_json(STATUS, {'job_id': job_id, 'status': 'starting', 'epochs': epochs, 'epoch': 0,
-                             'progress': 0, 'history': [], 'log_tail': [], 'error': None, 'started_at': now()})
+        with FileLock(STATUS_LOCK):
+            atomic_json(STATUS, {'job_id': job_id, 'status': 'starting', 'epochs': epochs, 'epoch': 0,
+                                 'progress': 0, 'history': [], 'log_tail': [], 'error': None, 'started_at': now()})
         def run():
             try:
                 train(epochs, lock=lock, job_id=job_id)

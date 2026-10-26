@@ -10,6 +10,7 @@ Date: 26 October 2026 (India). Base commit: `de51a17`.
 | Repeated `/train` requests and CLI runs could overwrite each other's checkpoint/logs | Shared OS-backed file lock across processes; 409 on duplicate API training; CLI exits clearly |
 | Checkpoints were overwritten directly after each epoch | Versioned checkpoint is verified and atomically replaced after a successful complete run; previous valid model survives failures |
 | No persisted completion/failure/interruption state | Atomic job state, exception reporting, traceback log, restart/interruption detection |
+| Windows denied replacing `training_status.json` while the UI polled training progress | Serialize status readers/writers with a lock and retry transient `PermissionError` during atomic replacement |
 | WAV validation trusted header without checking actual payload | Check sample rate/channels/PCM width/compression/duration, truncated data, silence and streamed request size |
 | Upload filenames/hand-edited metadata could lead to unsafe paths | Server UUID upload names, strict metadata names, confined generated paths and symlink rejection |
 | Metadata used platform-default encoding, risking Malayalam corruption on Windows | Explicit UTF-8, NFC text normalization, atomic metadata updates with a dataset lock |
@@ -32,10 +33,10 @@ Environment: Linux, Python 3.12.14, torch/torchaudio 2.6.0+cpu, Node 24.22.1, Ne
 
 - Python dependencies installed; imports for torch, torchaudio, FastAPI and Uvicorn succeeded; `pip check` reported no broken requirements.
 - `python -m compileall -q backend tests`: passed.
-- `python -m pytest -q`: **24 passed**. One third-party Starlette/httpx deprecation warning does not affect results.
+- `python -m pytest -q`: **25 passed**. One third-party Starlette/httpx deprecation warning does not affect results.
 - Tests include two 0.6-second synthetic 220 Hz sine clips, with Malayalam labels, trained for two epochs. These labels deliberately exercise Malayalam tokenization; the sine waves are **not spoken Malayalam** and do not validate acoustic/linguistic quality.
 - Actual model optimization, atomic checkpoint save, safe reload, `/health` readiness, `/speak`, and `/audio` retrieval passed. Returned WAV header is mono PCM16 at 22,050 Hz; decoded samples are nonempty and nonzero.
-- Failure tests cover malformed/truncated/stereo/wrong-rate/short/long/silent/oversized audio; blank/control/overlength transcripts; missing/corrupt/legacy/non-finite checkpoints; unknown characters; invalid speed/emotion/epochs; metadata traversal; generated-file symlinks; reconstruction exceptions; CORS; lock contention including another process; interrupted and failed jobs.
+- Failure tests cover malformed/truncated/stereo/wrong-rate/short/long/silent/oversized audio; blank/control/overlength transcripts; missing/corrupt/legacy/non-finite checkpoints; unknown characters; invalid speed/emotion/epochs; metadata traversal; generated-file symlinks; reconstruction exceptions; CORS; lock contention including another process; interrupted and failed jobs; transient Windows status-file access denial.
 - A failed retraining attempt was verified to preserve an actually loadable previous checkpoint.
 - Frontend production build and TypeScript checks passed.
 - `npm run test:e2e`: **1 full-flow Chromium test passed** against real Uvicorn and Next.js servers. Verified simulated microphone → WAV conversion/preview, two synthetic uploads, training, readiness gate, Malayalam request, audio playback with advancing playback time, WAV download, readable unknown-character errors, no browser runtime errors, and no horizontal overflow at 390px width.
@@ -46,7 +47,7 @@ The initial install test exposed a mismatched torchaudio binary; reinstalling th
 ## Changed files
 
 - `backend/core.py`: validated data/text IO, original model, audio transforms/reconstruction and checkpoint validation.
-- `backend/train.py`: lock, training job lifecycle, progress/logs, CPU/CUDA selection, atomic checkpoints.
+- `backend/train.py`: training/status locks, job lifecycle, progress/logs, CPU/CUDA selection, atomic checkpoints.
 - `backend/api.py`: all seven requested endpoints, structured errors, secure uploads and audio retrieval.
 - `backend/requirements.txt`, `backend/requirements-dev.txt`: runtime and test dependencies.
 - `frontend/app/page.tsx`, `frontend/app/layout.tsx`, `frontend/app/globals.css`: responsive working interface.

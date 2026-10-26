@@ -16,7 +16,7 @@ def private_paths(tmp_path, monkeypatch):
             if hasattr(module, key):
                 monkeypatch.setattr(module, key, value)
     for module in (train, api):
-        for key, value in dict(STATUS=data/'training_status.json', LOCK=data/'training.lock', DATA_LOCK=data/'dataset.lock').items():
+        for key, value in dict(STATUS=data/'training_status.json', STATUS_LOCK=data/'training_status.lock', LOCK=data/'training.lock', DATA_LOCK=data/'dataset.lock').items():
             if hasattr(module, key):
                 monkeypatch.setattr(module, key, value)
     torch.set_num_threads(2)
